@@ -1,7 +1,17 @@
 // dria desktop — main app logic
-// Tauri API imports (uncomment when building with Tauri)
-// const { invoke } = window.__TAURI__.core;
-// const { listen } = window.__TAURI__.event;
+
+// Tauri API — available when running in Tauri, graceful fallback in browser
+const isTauri = !!window.__TAURI__;
+const invoke = isTauri ? window.__TAURI__.core.invoke : async () => null;
+const listen = isTauri ? window.__TAURI__.event.listen : async () => {};
+
+// Listen for global shortcut events from Rust
+listen('global-shortcut', (event) => {
+  const key = event.payload;
+  if (key.includes('1')) captureScreen();
+  else if (key.includes('2')) submitQuestion();
+  else if (key.includes('3')) toggleWindow();
+});
 
 // State
 const state = {
@@ -283,6 +293,154 @@ renderChat();
 setInterval(() => {
   localStorage.setItem('messages', JSON.stringify(state.messages.slice(-50)));
 }, 5000);
+
+// Screen capture
+async function captureScreen() {
+  try {
+    const imageData = await invoke('capture_screen');
+    if (imageData) {
+      state.capturedImage = imageData;
+      // Show preview in chat
+      addMessage('user', '[Screenshot captured — press Ctrl+Alt+2 to send]');
+      // Update last message with image
+      const lastBubble = chatArea.querySelector('.message:last-child .bubble');
+      if (lastBubble) {
+        const img = document.createElement('img');
+        img.src = imageData;
+        img.style.maxWidth = '100%';
+        img.style.borderRadius = '6px';
+        img.style.marginBottom = '4px';
+        lastBubble.prepend(img);
+      }
+    }
+  } catch (err) {
+    addMessage('assistant', `Capture failed: ${err}`);
+  }
+}
+
+// Screenshot button
+document.getElementById('screenshotBtn').addEventListener('click', captureScreen);
+
+// Toggle window visibility
+function toggleWindow() {
+  // Handled by Rust tray click — this is for hotkey
+  if (isTauri) invoke('toggle_window');
+}
+
+// Paste from clipboard
+document.getElementById('pasteBtn').addEventListener('click', async () => {
+  try {
+    const text = isTauri
+      ? await invoke('get_clipboard_text')
+      : await navigator.clipboard.readText();
+    if (text) questionInput.value = text;
+    questionInput.dispatchEvent(new Event('input'));
+  } catch {}
+});
+
+// Question detection patterns (ported from macOS)
+function detectQuestionType(text) {
+  const lower = text.toLowerCase().trim();
+  if (lower.startsWith('true or false')) return 'T/F';
+  if (/^[a-d]\.\s/im.test(text) || /\n[a-d]\.\s/im.test(text)) return 'MC';
+  if (text.includes('___') || lower.includes('identify the')) return 'ID';
+  if (lower.startsWith('explain') || lower.startsWith('discuss') || text.length > 100 && text.includes('?')) return 'Essay';
+  return null;
+}
+
+// Clipboard monitoring
+let clipboardInterval = null;
+let lastClipboard = '';
+watchBtn.addEventListener('click', () => {
+  watching = !watching;
+  watchBtn.classList.toggle('active', watching);
+  watchBtn.textContent = watching ? '👁 Watching' : '👁 Auto';
+
+  if (watching) {
+    clipboardInterval = setInterval(async () => {
+      try {
+        const text = isTauri
+          ? await invoke('get_clipboard_text')
+          : await navigator.clipboard.readText();
+        if (text && text !== lastClipboard && text.length > 20) {
+          lastClipboard = text;
+          const type = detectQuestionType(text);
+          if (type) {
+            questionInput.value = text;
+            questionInput.dispatchEvent(new Event('input'));
+            // Auto-submit if detection is confident
+            submitQuestion();
+          }
+        }
+      } catch {}
+    }, 1500);
+  } else {
+    clearInterval(clipboardInterval);
+    clipboardInterval = null;
+  }
+});
+
+// Voice input via Web Speech API (works in Chrome/Edge, Tauri WebView)
+let recognition = null;
+if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = 'en-US';
+
+  let finalTranscript = '';
+
+  recognition.onresult = (event) => {
+    let interim = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      if (event.results[i].isFinal) {
+        finalTranscript += event.results[i][0].transcript + ' ';
+      } else {
+        interim += event.results[i][0].transcript;
+      }
+    }
+    questionInput.value = finalTranscript + interim;
+    questionInput.dispatchEvent(new Event('input'));
+  };
+
+  recognition.onerror = () => {
+    state.isListening = false;
+    micBtn.classList.remove('recording');
+    micBtn.textContent = '🎤';
+    voiceBar.style.display = 'none';
+  };
+
+  recognition.onend = () => {
+    // Restart if still listening (continuous mode)
+    if (state.isListening) recognition.start();
+  };
+}
+
+micBtn.addEventListener('click', () => {
+  if (!recognition) {
+    addMessage('assistant', 'Speech recognition not available in this browser.');
+    return;
+  }
+  state.isListening = !state.isListening;
+  micBtn.classList.toggle('recording', state.isListening);
+  micBtn.textContent = state.isListening ? '🔴' : '🎤';
+  voiceBar.style.display = state.isListening ? 'flex' : 'none';
+
+  if (state.isListening) {
+    recognition.start();
+  } else {
+    recognition.stop();
+  }
+});
+
+voiceStop.addEventListener('click', () => {
+  state.isListening = false;
+  micBtn.classList.remove('recording');
+  micBtn.textContent = '🎤';
+  voiceBar.style.display = 'none';
+  if (recognition) recognition.stop();
+});
 
 // Load settings
 document.getElementById('apiKeyInput').value = state.apiKey;
